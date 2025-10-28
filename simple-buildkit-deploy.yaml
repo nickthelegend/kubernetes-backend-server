@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-service
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deploy-service
+  template:
+    metadata:
+      labels:
+        app: deploy-service
+    spec:
+      serviceAccountName: deploy-service-sa
+      containers:
+      - name: deploy-service
+        image: node:18-alpine
+        workingDir: /app
+        command: ["/bin/sh"]
+        args: ["-c", "npm init -y && npm install express @kubernetes/client-node@0.18.1 && cat > server.js << 'EOF' && node server.js\nconst express = require('express');\nconst k8s = require('@kubernetes/client-node');\nconst app = express();\napp.use(express.json());\nconst kc = new k8s.KubeConfig();\nkc.loadFromCluster();\nconst k8sApi = kc.makeApiClient(k8s.CoreV1Api);\nconst k8sBatchApi = kc.makeApiClient(k8s.BatchV1Api);\nconst k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api);\nconst namespace = process.env.NAMESPACE || 'default';\napp.post('/deploy', async (req, res) => {\n  try {\n    const { repo_url, image_name, registry = 'registry.digitalocean.com/orcanet', app_name, port = 3000, registry_auth = 'regcred' } = req.body;\n    if (!repo_url || !image_name || !app_name) return res.status(400).json({ error: 'Missing required fields' });\n    const jobId = app_name + '-' + Date.now();\n    const job = {\n      apiVersion: 'batch/v1', kind: 'Job', metadata: { name: jobId, namespace },\n      spec: { template: { spec: { restartPolicy: 'Never',\n        initContainers: [{ name: 'git-clone', image: 'alpine/git:latest', command: ['git', 'clone', repo_url, '/workspace'], volumeMounts: [{ name: 'workspace', mountPath: '/workspace' }] }],\n        containers: [{ name: 'buildctl', image: 'moby/buildkit:latest', command: ['buildctl'], args: ['--addr', 'tcp://buildkitd:1234', 'build', '--frontend', 'dockerfile.v0', '--local', 'context=/workspace', '--local', 'dockerfile=/workspace', '--output', 'type=image,name=' + registry + '/' + image_name + ':latest,push=true'], volumeMounts: [{ name: 'workspace', mountPath: '/workspace' }, { name: 'docker-config', mountPath: '/root/.docker' }] }],\n        volumes: [{ name: 'workspace', emptyDir: {} }, { name: 'docker-config', secret: { secretName: registry_auth, items: [{ key: '.dockerconfigjson', path: 'config.json' }] } }] } } }\n    };\n    await k8sBatchApi.createNamespacedJob(namespace, job);\n    res.json({ job_id: jobId, status: 'started' });\n  } catch (error) { res.status(500).json({ error: error.message }); }\n});\napp.get('/status/:jobId', async (req, res) => {\n  try {\n    const jobResponse = await k8sBatchApi.readNamespacedJob(req.params.jobId, namespace);\n    const job = jobResponse.body;\n    let status = 'running', phase = 'building', message = 'Build in progress';\n    if (job.status.succeeded > 0) { status = 'completed'; phase = 'deployed'; message = 'Build successful'; }\n    else if (job.status.failed > 0) { status = 'failed'; phase = 'failed'; message = 'Build failed'; }\n    res.json({ job_id: req.params.jobId, status, phase, message, timestamp: new Date().toISOString() });\n  } catch (error) { res.status(500).json({ error: error.message }); }\n});\napp.listen(8080, () => console.log('Deploy service running on port 8080'));\nEOF"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: NAMESPACE
+          value: "default"
