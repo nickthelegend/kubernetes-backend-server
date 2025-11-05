@@ -1,0 +1,9 @@
+
+echo Restarting deployment...
+kubectl rollout restart deployment/deploy-service
+
+echo Waiting for rollout...
+kubectl rollout status deployment/deploy-service
+
+echo Checking pods...
+kubectl get pods -l app=deploy-service

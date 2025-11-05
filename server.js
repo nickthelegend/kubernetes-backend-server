@@ -15,6 +15,11 @@ const k8sNetworkingApi = kc.makeApiClient(k8s.NetworkingV1Api);
 
 const namespace = process.env.NAMESPACE || 'default';
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Test endpoint for debugging
 app.post('/test', (req, res) => {
   console.log('Test endpoint - Raw body:', req.body);
