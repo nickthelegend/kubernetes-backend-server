@@ -59,7 +59,7 @@ app.post('/deploy', async (req, res) => {
       job_id: jobId, 
       status: 'completed',
       domain: appDomain,
-      url: `http://${appDomain}`
+      url: `https://${appDomain}`
     });
   } catch (error) {
     console.error('Deploy error:', error);
@@ -160,17 +160,25 @@ async function createOrUpdateDeployment({ app_name, image_name, port, registry_a
     }
   }
   
-  // Create ingress with subdomain
+  // Create ingress with subdomain and SSL
   const ingress = {
     apiVersion: 'networking.k8s.io/v1',
     kind: 'Ingress',
     metadata: {
       name: `${app_name}-ingress`,
       namespace,
-      annotations: { 'nginx.ingress.kubernetes.io/rewrite-target': '/' }
+      annotations: {
+        'nginx.ingress.kubernetes.io/rewrite-target': '/',
+        'cert-manager.io/cluster-issuer': 'letsencrypt-prod',
+        'nginx.ingress.kubernetes.io/ssl-redirect': 'true'
+      }
     },
     spec: {
       ingressClassName: 'nginx',
+      tls: [{
+        hosts: [domain],
+        secretName: `${app_name}-tls`
+      }],
       rules: [{
         host: domain,
         http: {
