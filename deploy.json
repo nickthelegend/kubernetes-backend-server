@@ -1,0 +1,6 @@
+{
+  "image_name": "ghcr.io/nickthelegend/hello-server:latest",
+  "app_name": "hello-demo",
+  "port": 3000,
+  "registry_auth": "ghcr-secret"
+}
