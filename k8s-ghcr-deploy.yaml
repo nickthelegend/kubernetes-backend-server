@@ -16,7 +16,7 @@ spec:
       serviceAccountName: deploy-service-sa
       containers:
       - name: deploy-service
-        image: ghcr.io/nickthelegend/kubernetes-backend-server:latest
+        image: ghcr.io/nickthelegend/kubernetes-backend-server:main
         ports:
         - containerPort: 8080
         env:
