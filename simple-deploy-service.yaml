@@ -1,0 +1,226 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-service
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deploy-service
+  template:
+    metadata:
+      labels:
+        app: deploy-service
+    spec:
+      serviceAccountName: deploy-service-sa
+      containers:
+      - name: deploy-service
+        image: node:18-alpine
+        workingDir: /app
+        command: ["/bin/sh"]
+        args: ["-c", "npm init -y && npm install express @kubernetes/client-node cors && cat > server.js << 'EOF' && node server.js
+const express = require('express');
+const cors = require('cors');
+const k8s = require('@kubernetes/client-node');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const kc = new k8s.KubeConfig();
+kc.loadFromCluster();
+
+const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
+const k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api);
+const k8sNetworkingApi = kc.makeApiClient(k8s.NetworkingV1Api);
+
+const namespace = process.env.NAMESPACE || 'default';
+
+app.post('/deploy', async (req, res) => {
+  try {
+    console.log('Request body:', req.body);
+    const { image_name, app_name, port = 3000, registry_auth = 'regcred', domain } = req.body;
+    
+    if (!image_name || !app_name) {
+      return res.status(400).json({ error: 'Missing required fields: image_name, app_name' });
+    }
+
+    const jobId = app_name + '-' + Date.now();
+    const appDomain = domain || app_name + '.0rca.live';
+    
+    await createOrUpdateDeployment({ app_name, image_name, port, registry_auth, domain: appDomain });
+    
+    res.json({ 
+      job_id: jobId, 
+      status: 'completed',
+      domain: appDomain,
+      url: 'http://' + appDomain
+    });
+  } catch (error) {
+    console.error('Deploy error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/status/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const appName = jobId.split('-')[0];
+    
+    const deploymentResponse = await k8sAppsApi.readNamespacedDeployment(appName, namespace);
+    const deployment = deploymentResponse.body;
+    
+    let status = 'running';
+    let phase = 'deploying';
+    let message = 'Deployment in progress';
+    
+    if (deployment.status.readyReplicas > 0) {
+      status = 'completed';
+      phase = 'deployed';
+      message = 'Deployment successful';
+    }
+    
+    res.json({
+      job_id: jobId,
+      status,
+      phase,
+      message,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    if (error.response && error.response.statusCode === 404) {
+      return res.status(404).json({ error: 'Deployment not found' });
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+async function createOrUpdateDeployment({ app_name, image_name, port, registry_auth, domain }) {
+  const deployment = {
+    apiVersion: 'apps/v1',
+    kind: 'Deployment',
+    metadata: { name: app_name, namespace },
+    spec: {
+      replicas: 1,
+      selector: { matchLabels: { app: app_name } },
+      template: {
+        metadata: { labels: { app: app_name } },
+        spec: {
+          containers: [{
+            name: app_name,
+            image: image_name,
+            ports: [{ containerPort: port }]
+          }],
+          imagePullSecrets: [{ name: registry_auth }]
+        }
+      }
+    }
+  };
+  
+  try {
+    await k8sAppsApi.replaceNamespacedDeployment(app_name, namespace, deployment);
+  } catch (error) {
+    if (error.response && error.response.statusCode === 404) {
+      await k8sAppsApi.createNamespacedDeployment(namespace, deployment);
+    } else {
+      throw error;
+    }
+  }
+  
+  const service = {
+    apiVersion: 'v1',
+    kind: 'Service',
+    metadata: { name: app_name, namespace },
+    spec: {
+      selector: { app: app_name },
+      ports: [{ port: 80, targetPort: port }],
+      type: 'ClusterIP'
+    }
+  };
+  
+  try {
+    await k8sApi.replaceNamespacedService(app_name, namespace, service);
+  } catch (error) {
+    if (error.response && error.response.statusCode === 404) {
+      await k8sApi.createNamespacedService(namespace, service);
+    } else {
+      throw error;
+    }
+  }
+  
+  const ingress = {
+    apiVersion: 'networking.k8s.io/v1',
+    kind: 'Ingress',
+    metadata: {
+      name: app_name + '-ingress',
+      namespace,
+      annotations: { 'nginx.ingress.kubernetes.io/rewrite-target': '/' }
+    },
+    spec: {
+      ingressClassName: 'nginx',
+      rules: [{
+        host: domain,
+        http: {
+          paths: [{
+            path: '/',
+            pathType: 'Prefix',
+            backend: { service: { name: app_name, port: { number: 80 } } }
+          }]
+        }
+      }]
+    }
+  };
+  
+  try {
+    await k8sNetworkingApi.replaceNamespacedIngress(app_name + '-ingress', namespace, ingress);
+  } catch (error) {
+    if (error.response && error.response.statusCode === 404) {
+      await k8sNetworkingApi.createNamespacedIngress(namespace, ingress);
+    } else {
+      throw error;
+    }
+  }
+}
+
+app.listen(8080, () => console.log('Deploy service running on port 8080'));
+EOF"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: NAMESPACE
+          value: "default"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deploy-service
+  namespace: default
+spec:
+  selector:
+    app: deploy-service
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: deploy-service-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: backend.0rca.live
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: deploy-service
+            port:
+              number: 80

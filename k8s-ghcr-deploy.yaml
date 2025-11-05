@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-service
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deploy-service
+  template:
+    metadata:
+      labels:
+        app: deploy-service
+    spec:
+      serviceAccountName: deploy-service-sa
+      containers:
+      - name: deploy-service
+        image: ghcr.io/nickthelegend/kubernetes-backend-server:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: NAMESPACE
+          value: "default"
+      imagePullSecrets:
+      - name: ghcr-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deploy-service
+  namespace: default
+spec:
+  selector:
+    app: deploy-service
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: deploy-service-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: backend.0rca.live
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: deploy-service
+            port:
+              number: 80

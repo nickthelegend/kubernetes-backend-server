@@ -1,8 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const k8s = require('@kubernetes/client-node');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
 app.use(cors());
 app.use(express.json());
 
@@ -12,6 +17,7 @@ kc.loadFromCluster();
 const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
 const k8sBatchApi = kc.makeApiClient(k8s.BatchV1Api);
 const k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api);
+const k8sNetworkingApi = kc.makeApiClient(k8s.NetworkingV1Api);
 
 const namespace = process.env.NAMESPACE || 'default';
 
@@ -19,29 +25,38 @@ const namespace = process.env.NAMESPACE || 'default';
 app.post('/deploy', async (req, res) => {
   try {
     const { 
-      repo_url, 
-      image_name, 
-      registry = 'registry.digitalocean.com/orcanet', 
+      image_name, // Full image path like 'ghcr.io/user/repo:tag'
       app_name, 
       port = 3000, 
-      registry_auth = 'regcred' 
+      registry_auth = 'regcred',
+      domain // Optional custom domain, defaults to {app_name}.0rca.live
     } = req.body;
     
-    if (!repo_url || !image_name || !app_name) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!image_name || !app_name) {
+      return res.status(400).json({ error: 'Missing required fields: image_name, app_name' });
     }
 
     const jobId = `${app_name}-${Date.now()}`;
+    const appDomain = domain || `${app_name}.0rca.live`;
     
-    // Create BuildKit build job
-    await createBuildKitJob(jobId, { repo_url, image_name, registry, registry_auth });
+    // Broadcast start event
+    broadcastLog(jobId, 'info', `Starting deployment for ${app_name}`);
+    broadcastLog(jobId, 'info', `Image: ${image_name}`);
+    broadcastLog(jobId, 'info', `Domain: ${appDomain}`);
     
-    // Create or update deployment
-    await createOrUpdateDeployment({ app_name, image_name, registry, port, registry_auth });
+    // Create deployment directly (no build needed)
+    await createOrUpdateDeployment({ app_name, image_name, port, registry_auth, domain: appDomain });
+    broadcastLog(jobId, 'success', `Deployment created! App will be available at: http://${appDomain}`);
     
-    res.json({ job_id: jobId, status: 'started' });
+    res.json({ 
+      job_id: jobId, 
+      status: 'completed',
+      domain: appDomain,
+      url: `http://${appDomain}`
+    });
   } catch (error) {
     console.error('Deploy error:', error);
+    broadcastLog('error', 'error', `Deploy failed: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
@@ -50,22 +65,24 @@ app.post('/deploy', async (req, res) => {
 app.get('/status/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
+    const appName = jobId.split('-')[0]; // Extract app name from job ID
     
-    const jobResponse = await k8sBatchApi.readNamespacedJob(jobId, namespace);
-    const job = jobResponse.body;
+    // Check deployment status instead of build job
+    const deploymentResponse = await k8sAppsApi.readNamespacedDeployment(appName, namespace);
+    const deployment = deploymentResponse.body;
     
     let status = 'running';
-    let phase = 'building';
-    let message = 'Build in progress';
+    let phase = 'deploying';
+    let message = 'Deployment in progress';
     
-    if (job.status.succeeded > 0) {
+    if (deployment.status.readyReplicas > 0) {
       status = 'completed';
       phase = 'deployed';
-      message = 'Build and deployment successful';
-    } else if (job.status.failed > 0) {
+      message = 'Deployment successful';
+    } else if (deployment.status.replicas === 0) {
       status = 'failed';
       phase = 'failed';
-      message = 'Build failed';
+      message = 'Deployment failed';
     }
     
     res.json({
@@ -77,7 +94,7 @@ app.get('/status/:jobId', async (req, res) => {
     });
   } catch (error) {
     if (error.response?.statusCode === 404) {
-      return res.status(404).json({ error: 'Job not found' });
+      return res.status(404).json({ error: 'Deployment not found' });
     }
     res.status(500).json({ error: error.message });
   }
@@ -124,70 +141,10 @@ app.get('/logs/:jobId', async (req, res) => {
   }
 });
 
-async function createBuildKitJob(jobId, { repo_url, image_name, registry, registry_auth }) {
-  const job = {
-    apiVersion: 'batch/v1',
-    kind: 'Job',
-    metadata: {
-      name: jobId,
-      namespace
-    },
-    spec: {
-      template: {
-        spec: {
-          restartPolicy: 'Never',
-          initContainers: [{
-            name: 'git-clone',
-            image: 'alpine/git:latest',
-            command: ['git', 'clone', repo_url, '/workspace'],
-            volumeMounts: [{
-              name: 'workspace',
-              mountPath: '/workspace'
-            }]
-          }],
-          containers: [{
-            name: 'buildctl',
-            image: 'moby/buildkit:latest',
-            command: ['buildctl'],
-            args: [
-              '--addr', 'tcp://buildkitd:1234',
-              'build',
-              '--frontend', 'dockerfile.v0',
-              '--local', 'context=/workspace',
-              '--local', 'dockerfile=/workspace',
-              '--output', `type=image,name=${registry}/${image_name}:latest,push=true`
-            ],
-            volumeMounts: [{
-              name: 'workspace',
-              mountPath: '/workspace'
-            }, {
-              name: 'docker-config',
-              mountPath: '/root/.docker'
-            }]
-          }],
-          volumes: [{
-            name: 'workspace',
-            emptyDir: {}
-          }, {
-            name: 'docker-config',
-            secret: {
-              secretName: registry_auth,
-              items: [{
-                key: '.dockerconfigjson',
-                path: 'config.json'
-              }]
-            }
-          }]
-        }
-      }
-    }
-  };
-  
-  await k8sBatchApi.createNamespacedJob(namespace, job);
-}
+// Build job function removed - we now deploy pre-built images directly
 
-async function createOrUpdateDeployment({ app_name, image_name, registry, port, registry_auth }) {
-  const imageName = `${registry}/${image_name}:latest`;
+async function createOrUpdateDeployment({ app_name, image_name, port, registry_auth, domain }) {
+  const imageName = image_name; // Use full image path as provided
   
   const deployment = {
     apiVersion: 'apps/v1',
@@ -254,9 +211,92 @@ async function createOrUpdateDeployment({ app_name, image_name, registry, port, 
       throw error;
     }
   }
+  
+  // Create ingress
+  const ingress = {
+    apiVersion: 'networking.k8s.io/v1',
+    kind: 'Ingress',
+    metadata: {
+      name: `${app_name}-ingress`,
+      namespace,
+      annotations: {
+        'nginx.ingress.kubernetes.io/rewrite-target': '/'
+      }
+    },
+    spec: {
+      ingressClassName: 'nginx',
+      rules: [{
+        host: domain,
+        http: {
+          paths: [{
+            path: '/',
+            pathType: 'Prefix',
+            backend: {
+              service: {
+                name: app_name,
+                port: { number: 80 }
+              }
+            }
+          }]
+        }
+      }]
+    }
+  };
+  
+  try {
+    await k8sNetworkingApi.replaceNamespacedIngress(`${app_name}-ingress`, namespace, ingress);
+  } catch (error) {
+    if (error.response?.statusCode === 404) {
+      await k8sNetworkingApi.createNamespacedIngress(namespace, ingress);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// WebSocket connection handling
+wss.on('connection', (ws) => {
+  console.log('Client connected to WebSocket');
+  ws.subscribedJobs = new Set();
+  
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      if (data.action === 'subscribe' && data.job_id) {
+        ws.subscribedJobs.add(data.job_id);
+        console.log(`Client subscribed to job: ${data.job_id}`);
+      } else if (data.action === 'unsubscribe' && data.job_id) {
+        ws.subscribedJobs.delete(data.job_id);
+        console.log(`Client unsubscribed from job: ${data.job_id}`);
+      }
+    } catch (error) {
+      console.error('WebSocket message error:', error);
+    }
+  });
+  
+  ws.on('close', () => console.log('Client disconnected'));
+});
+
+// Broadcast logs to subscribed clients only
+function broadcastLog(jobId, level, message) {
+  const logData = {
+    job_id: jobId,
+    level,
+    message,
+    timestamp: new Date().toISOString()
+  };
+  
+  console.log(`[${level.toUpperCase()}] ${jobId}: ${message}`);
+  
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.subscribedJobs.has(jobId)) {
+      client.send(JSON.stringify(logData));
+    }
+  });
 }
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Deploy service running on port ${PORT}`);
+  console.log(`WebSocket server ready for real-time logs`);
 });
